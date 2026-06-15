@@ -84,6 +84,7 @@ enum llm_type {
     LLM_TYPE_26B,
     LLM_TYPE_27B,
     LLM_TYPE_30B,
+    LLM_TYPE_31B,
     LLM_TYPE_32B,
     LLM_TYPE_34B,
     LLM_TYPE_35B,
@@ -118,6 +119,7 @@ enum llm_type {
     LLM_TYPE_16B_A1B,
     LLM_TYPE_21B_A3B, // Ernie MoE small
     LLM_TYPE_24B_A2B, // lfm2moe
+    LLM_TYPE_26B_A4B,
     LLM_TYPE_30B_A3B,
     LLM_TYPE_31B_A3_5B,
     LLM_TYPE_35B_A3B, // Qwen3.5
@@ -270,6 +272,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_norm         = nullptr;
     struct ggml_tensor * ffn_norm_b       = nullptr;
     struct ggml_tensor * ffn_post_norm    = nullptr;
+    struct ggml_tensor * ffn_post_norm_1  = nullptr;
+    struct ggml_tensor * ffn_post_norm_2  = nullptr;
+    struct ggml_tensor * ffn_pre_norm_2   = nullptr;
     struct ggml_tensor * layer_out_norm   = nullptr;
     struct ggml_tensor * layer_out_norm_b = nullptr;
     struct ggml_tensor * ffn_norm_exps    = nullptr;
@@ -285,6 +290,7 @@ struct llama_layer {
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
+    struct ggml_tensor * ffn_gate_inp_s    = nullptr;
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
@@ -447,6 +453,9 @@ struct llama_layer {
     struct ggml_tensor * laurel_l             = nullptr;
     struct ggml_tensor * laurel_r             = nullptr;
     struct ggml_tensor * laurel_post_norm     = nullptr;
+
+    // gemma4
+    struct ggml_tensor * out_scale = nullptr;
 
     // openai-moe
     struct ggml_tensor * attn_sinks = nullptr;

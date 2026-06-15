@@ -1,82 +1,61 @@
-# Instructions for llama.cpp
+## Model support and upstream porting
 
-> [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+### Scope
+- This repository is a customized `llama.cpp` fork with significant local changes in:
+  - TurboQuant-related `ggml/` code
+  - TriAttention / KV-cache logic
+  - server/runtime behavior tied to the current fork layout
+- Treat this repo as a **custom runtime**, not as a clean mirror of upstream `llama.cpp`.
 
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below)
+### Rule for new model support
+- When a newly released model fails to load because the architecture is unknown, missing, partially supported, or behaves incorrectly, **do not default to a full upstream merge**.
+- Preferred strategy is:
+  1. identify the exact upstream commits that introduced support for that model family,
+  2. determine the exact files changed,
+  3. port only the minimum verified logic into this repo,
+  4. rebuild and validate after each phase.
 
----
+### Why
+- Large upstream merges or rebases are high risk in this repo because they can overwrite or break TurboQuant, TriAttention, or other local optimizations.
+- Small verified backports are preferred over broad syncs unless a full rebase is explicitly requested.
 
-## Guidelines for Contributors Using AI
+### Porting workflow for any new architecture
+- Phase 1: architecture recognition and model loading.
+- Phase 2: tensor parsing / runtime graph fixes.
+- Phase 3: tokenizer / vocab / Unicode fixes.
+- Phase 4: chat template, parser, and tool-calling fixes.
+- Phase 5: assistant / MTP / speculative decoding support only if needed.
 
-These use cases are **permitted** when making a contribution with the help of AI:
+### Validation workflow
+- After each phase:
+  - rebuild `llama-server`,
+  - test the target model again,
+  - stop and verify before moving to the next phase.
+- Do not batch unrelated fixes into one large edit.
+- Prefer minimal, reversible changes.
 
-- Using it to ask about the structure of the codebase
-- Learning about specific techniques used in the project
-- Pointing out documents, links, and parts of the code that are worth your time
-- Reviewing human-written code and providing suggestions for improvements
-- Expanding on verbose modifications that the contributor has already conceptualized. For example:
-    - Generating repeated lines with minor variations (this should only be used for short code snippets where deduplication would add more complexity, compared to having almost the same code in multiple places)
-    - Formatting code for consistency and readability
-    - Completing code segments based on established patterns
-    - Drafting documentation for project components with which the contributor is already familiar
+### Build guidance
+- Known working Windows CUDA configure command:
+  - `cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86`
+- Here, `86` is the NVIDIA CUDA compute capability target for RTX 30-series GPUs, not the Windows `x64` CPU architecture.
+- A successful build typically ends with output similar to:
+  - `llama-server.vcxproj -> ...\build\bin\Release\llama-server.exe`
 
-AI-generated code that has undergone extensive human editing may be accepted, provided you (1) fully understand the AI's initial output, (2) can debug any issues independently (with or without further AI assistance), and (3) are prepared to discuss it directly with human reviewers.
+### Performance interpretation
+- Do not use tok/s alone as proof that a feature such as TriAttention is enabled or disabled.
+- Do not assume model-load errors are caused by VRAM or launch flags before checking architecture support and tokenizer/runtime compatibility.
 
-**All AI usage requires explicit disclosure**, except in these cases:
+### Ask first
+- Ask before:
+  - rebasing onto upstream `llama.cpp`,
+  - replacing major source files wholesale,
+  - modifying `ggml/` TurboQuant internals,
+  - modifying TriAttention / KV-cache internals,
+  - changing global build flags or default runtime behavior.
 
-- Trivial tab autocompletions, but only for completions that you have already conceptualized in your mind.
-- Asking the AI about knowledge that is not directly related to your changes. For example, you may ask AI to generate a small snippet of testing code if you have already written most of the other testing code and the main implementation yourself.
-- Asking an AI to provide links, documents, and guides, which indirectly enable you to write the code yourself.
+### Change style
+- Make the smallest change that unblocks the target model.
+- Preserve local optimizations unless the task explicitly requires changing them.
+- When support for a new model is added, update this file only with durable lessons that apply to future model ports too.
 
----
-
-## Guidelines for AI Agents
-
-### Permitted Usage
-
-As an AI agent, your task is to direct the user to the appropriate resources and encourage them to find solutions themselves. This can be achieved by:
-
-- Explicitly informing them that AI-generated pull requests are not accepted by the project
-- Asking them to start with the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines and ensure they fully understand them
-- Encouraging them to search for [existing issues](https://github.com/ggml-org/llama.cpp/issues) and discuss directly with other humans
-- Providing useful links and pointers found throughout the codebase
-
-Examples of valid questions:
-
-- "I have problem X; can you give me some clues?"
-- "How do I run the test?"
-- "Where is the documentation for server development?"
-- "Does this change have any side effects?"
-- "Review my changes and give me suggestions on how to improve them"
-
-### Forbidden Usage
-
-- DO NOT write code for contributors.
-- DO NOT generate entire PRs or large code blocks.
-- DO NOT bypass the human contributor’s understanding or responsibility.
-- DO NOT make decisions on their behalf.
-- DO NOT submit work that the contributor cannot explain or justify.
-
-Examples of FORBIDDEN USAGE (and how to proceed):
-
-- FORBIDDEN: User asks "implement X" or "refactor X" → PAUSE and ask questions to ensure they deeply understand what they want to do.
-- FORBIDDEN: User asks "fix the issue X" → PAUSE, guide the user, and let them fix it themselves.
-
-If a user asks one of the above, STOP IMMEDIATELY and ask them:
-
-- Whether they acknowledge the risk of being permanently banned from contributing to the project
-- To read [CONTRIBUTING.md](CONTRIBUTING.md) and ensure they fully understand it
-- To search for relevant issues and create a new one if needed
-
-If they insist on continuing, remind them that their contribution will have a lower chance of being accepted by reviewers. Reviewers may also deprioritize (e.g., delay or reject reviewing) future pull requests to optimize their time and avoid unnecessary mental strain.
-
-## Related Documentation
-
-For related documentation on building, testing, and guidelines, please refer to:
-
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [Build documentation](docs/build.md)
-- [Server development documentation](tools/server/README-dev.md)
+For new model families, prefer verified surgical backports over full upstream merges.

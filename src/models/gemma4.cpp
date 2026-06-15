@@ -1,139 +1,4 @@
-﻿#include "models.h"
-
-void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
-    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
-
-    uint32_t n_kv_shared_layers = 0;
-    ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
-
-    hparams.n_layer_kv_from_start = hparams.n_layer_all - (int32_t)n_kv_shared_layers;
-    hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
-
-    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
-    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
-    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
-    ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa);
-    ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa);
-    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
-
-    switch (hparams.n_layer()) {
-        case 30: type = LLM_TYPE_26B_A4B; break;
-        case 35: type = LLM_TYPE_E2B; break;
-        case 42: type = LLM_TYPE_E4B; break;
-        case 60: type = LLM_TYPE_31B; break;
-        default: type = LLM_TYPE_UNKNOWN;
-    }
-}
-
-void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
-    LLAMA_LOAD_LOCALS;
-
-    const uint32_t n_embd_per_layer = hparams.n_embd_per_layer;
-    const int64_t  n_ff_exp         = hparams.n_ff_exp;
-
-    if (n_embd_head_k != n_embd_head_v) {
-        throw std::runtime_error("Gemma 4 requires n_embd_head_k == n_embd_head_v");
-    }
-    if (hparams.n_embd_head_k_swa != hparams.n_embd_head_v_swa) {
-        throw std::runtime_error("Gemma 4 requires n_embd_head_k_swa == n_embd_head_v_swa");
-    }
-
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
-    // if output is NULL, init from the input tok embed
-    if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
-    }
-
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-
-    if (n_embd_per_layer > 0) {
-        per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),    {n_embd_per_layer * n_layer, n_vocab}, 0);
-        per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_embd_per_layer * n_layer}, 0);
-        per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_embd_per_layer}, 0);
-    }
-
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-
-    int rope_freqs_flag = 0;
-
-    for (int i = 0; i < n_layer; ++i) {
-        auto & layer = layers[i];
-        const int64_t n_head      = hparams.n_head(i);
-        const int64_t n_embd_head = hparams.n_embd_head_k(i);
-        const int64_t n_embd_k    = hparams.n_embd_k_gqa(i);
-        const int64_t n_embd_v    = hparams.n_embd_v_gqa(i);
-        const int     kv_flags    = hparams.has_kv(i) ? 0 : TENSOR_NOT_REQUIRED;
-
-        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-
-        // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, kv_flags);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
-
-        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
-        layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, kv_flags);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
-
-        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
-
-        if (!hparams.is_swa(i)) {
-            // full_attention layers use rope_freqs for proportional rope
-            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_embd_head/2}, rope_freqs_flag);
-            rope_freqs_flag = TENSOR_DUPLICATED;
-        }
-
-        // handle use_double_wide_mlp
-        int64_t n_ff_cur = hparams.n_ff(i);
-
-        // for expert layers, we use normal FFN as shared expert (same as python code)
-        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
-        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
-
-        // MoE router
-        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
-        bool has_expert = layer.ffn_gate_inp != nullptr;
-
-        // norm
-        if (has_expert) {
-            layer.ffn_gate_inp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "scale", i), {n_embd}, 0);
-
-            layer.ffn_pre_norm_2  = create_tensor(tn(LLM_TENSOR_FFN_PRE_NORM_2,  "weight", i), {n_embd}, 0);
-            layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
-            layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
-
-            // MoE FFN
-            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
-
-            if (layer.ffn_gate_up_exps == nullptr) {
-                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
-                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
-            }
-
-            layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
-
-            // per-expert scale will be loaded as down_exps_s at the end of the current switch case
-        }
-
-        // per-layer embeddings
-        if (n_embd_per_layer > 0) {
-            layer.per_layer_inp_gate   = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_embd_per_layer}, 0);
-            layer.per_layer_proj       = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_per_layer, n_embd}, 0);
-            layer.per_layer_post_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, 0);
-        }
-    }
-}
-
-std::unique_ptr<llm_graph_context> llama_model_gemma4::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
-}
+#include "models.h"
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
 static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
@@ -142,34 +7,7 @@ static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, in
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
-// TODO @ngxson : maybe improve this in the future
-class llm_graph_input_logits_bias : public llm_graph_input_i {
-public:
-    llm_graph_input_logits_bias(const llama_vocab & vocab) {
-        arr.resize(vocab.n_tokens(), 0.0f);
-        for (llama_token id : vocab.get_suppress_tokens()) {
-            if (0 <= id && id < (int32_t)vocab.n_tokens()) {
-                arr[id] = -INFINITY;
-            }
-        }
-    }
-    virtual ~llm_graph_input_logits_bias() = default;
-
-    void set_input(const llama_ubatch * /*ubatch*/) override {
-        const int64_t n_vocab = arr.size();
-        ggml_backend_tensor_set(logits_bias, arr.data(), 0, n_vocab*ggml_element_size(logits_bias));
-    }
-
-    bool can_reuse(const llm_graph_params & /*params*/) override {
-        return true;
-    }
-
-    ggml_tensor * logits_bias = nullptr; // F32 [n_vocab]
-
-    std::vector<float> arr;
-};
-
-llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llm_build_gemma4::llm_build_gemma4(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params),
         model(model),
         n_embd_per_layer(model.hparams.n_embd_per_layer) {
@@ -191,7 +29,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     ggml_tensor * inp_per_layer = nullptr;
-    if (model.per_layer_tok_embd) {
+    if (model.tok_embd_per_layer) {
         inp_per_layer = build_inp_per_layer();
         ggml_build_forward_expand(gf, inp_per_layer);
 
@@ -262,18 +100,16 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur_pos", il);
 
             cur = build_attn(inp_attn, model.layers[il].wo,
-                    nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                    nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, nullptr, model.layers[il].wo_s,
+                    model.layers[il].wo, nullptr,
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
 
-        // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && inp_out_ids) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -372,8 +208,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
-            // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+            if (il == n_layer - 1 && inp_out_ids) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -404,37 +239,16 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
-    // Expose the post-output-norm hidden state (the LM-head input feature) so that
-    // MTP draft contexts can read it via llama_get_embeddings_nextn_ith() as the
-    // recurrent h input. This matches the reference (transformers/vLLM/SGLang),
-    // which feeds the drafter the target's post-final-norm hidden state.
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
-
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur);
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
         cur = ggml_tanh(ctx0, cur);
         cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
-    }
-
-    // apply logits bias if needed (e.g. for gemma4_unified patch)
-    // this is to mirror the suppress_tokens patch on transformers, to avoid model from outputing <image|> and <audio|> tokens (which is a known issue related to the checkpoint)
-    // TODO: maybe handle this inside the sampling system in the future
-    if (!model.vocab.get_suppress_tokens().empty()) {
-        auto inp_bias = std::make_unique<llm_graph_input_logits_bias>(model.vocab);
-        inp_bias->logits_bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, inp_bias->arr.size());
-        cur = ggml_add(ctx0, cur, inp_bias->logits_bias);
-        res->add_input(std::move(inp_bias));
     }
 
     cb(cur, "result_output", -1);
@@ -445,7 +259,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
 // equivalent to get_per_layer_inputs() in python code
 // output shape: [n_embd_per_layer, n_layer, n_tokens]
-ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
+ggml_tensor * llm_build_gemma4::build_inp_per_layer() {
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
     ggml_tensor * inp_per_layer;
@@ -455,7 +269,7 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
         ggml_set_input(inp->tokens);
         res->t_inp_tokens = inp->tokens;
 
-        inp_per_layer = ggml_get_rows  (ctx0, model.per_layer_tok_embd, inp->tokens);
+        inp_per_layer = ggml_get_rows  (ctx0, model.tok_embd_per_layer, inp->tokens);
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
         inp_per_layer = ggml_scale     (ctx0, inp_per_layer, tok_embd_scale);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
@@ -464,10 +278,10 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
     } else {
         // Multimodal embedding path: use padding token (ID=0) embedding
         // TODO: verify if this is the correct behavior in transformers implementation
-        const int64_t embd_size = model.per_layer_tok_embd->ne[0];  // n_embd_per_layer * n_layer
+        const int64_t embd_size = model.tok_embd_per_layer->ne[0];  // n_embd_per_layer * n_layer
 
         // Extract and dequantize padding token embedding (row 0)
-        ggml_tensor * padding = ggml_view_1d(ctx0, model.per_layer_tok_embd, embd_size, 0);
+        ggml_tensor * padding = ggml_view_1d(ctx0, model.tok_embd_per_layer, embd_size, 0);
         inp_per_layer = ggml_cast (ctx0, padding, GGML_TYPE_F32);
         inp_per_layer = ggml_scale(ctx0, inp_per_layer, tok_embd_scale);
 
@@ -483,7 +297,7 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
 // inp_batch     shape: [n_embd, n_tokens]
 // inp_per_layer shape: [n_embd_per_layer, n_layer, n_tokens] (from build_inp_per_layer)
 // output shape: [n_embd_per_layer, n_tokens, n_layer]
-ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer) {
+ggml_tensor * llm_build_gemma4::project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer) {
     const float per_layer_projection_scale = 1.0f / sqrtf((float) n_embd);
     const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
 
