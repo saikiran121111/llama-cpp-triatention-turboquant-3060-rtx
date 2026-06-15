@@ -11,12 +11,55 @@
 #include "ggml-impl.h"
 
 #include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-int turbo3_cpu_wht_group_size = 0;
+GGML_API int turbo3_cpu_wht_group_size = 0;
+
+/* ---------- InnerQ cross-TU shared state ---------- */
+/* Moved to ggml-base so both llama.dll and ggml-cuda.dll can link to them */
+
+#ifndef INNERQ_MAX_CHANNELS
+#define INNERQ_MAX_CHANNELS 128
+#endif
+
+GGML_API int g_innerq_finalized = 0;
+
+GGML_API float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
+};
+
+static int g_innerq_tensor_needs_update = 0;
+
+GGML_API void turbo_innerq_publish(const float * scale_inv, int group_size) {
+    int i;
+    for (i = 0; i < group_size && i < INNERQ_MAX_CHANNELS; i++) {
+        g_innerq_scale_inv_host[i] = scale_inv[i];
+    }
+    for (; i < INNERQ_MAX_CHANNELS; i++) {
+        g_innerq_scale_inv_host[i] = 1.0f;
+    }
+    g_innerq_finalized = 1;
+    g_innerq_tensor_needs_update = 1;
+}
+
+GGML_API int turbo_innerq_needs_tensor_update(void) {
+    return g_innerq_tensor_needs_update;
+}
+
+GGML_API void turbo_innerq_mark_tensor_updated(void) {
+    g_innerq_tensor_needs_update = 0;
+}
 
 /* ---------- constants ---------- */
 
