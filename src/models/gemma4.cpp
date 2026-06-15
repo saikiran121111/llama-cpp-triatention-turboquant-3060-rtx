@@ -124,10 +124,13 @@ llm_build_gemma4::llm_build_gemma4(const llama_model & model, const llm_graph_pa
         // feed-forward network
         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
         if (is_moe_layer) {
-            // MLP (shared exp)
-            ggml_tensor * cur_mlp = build_norm(attn_out,
-                    model.layers[il].ffn_norm, nullptr,
-                    LLM_NORM_RMS, il);
+            // Cache the RMS norm of attn_out — reused by shared expert norm,
+            // expert norm, and router logits (avoids 3 separate rms_norm calls)
+            ggml_tensor * attn_out_normed = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
+            cb(attn_out_normed, "attn_out_rms", il);
+
+            // MLP (shared exp) — reuse cached norm, apply ffn_norm weight
+            ggml_tensor * cur_mlp = ggml_mul(ctx0, attn_out_normed, model.layers[il].ffn_norm);
             cb(cur_mlp, "ffn_norm_1", il);
 
             cur_mlp = build_ffn(cur_mlp,
@@ -141,16 +144,16 @@ llm_build_gemma4::llm_build_gemma4(const llama_model & model, const llm_graph_pa
                     LLM_NORM_RMS, il);
             cb(cur_mlp, "ffn_mlp", il);
 
-            // Expert FFN
-            ggml_tensor * cur_moe = build_norm(attn_out,
-                    model.layers[il].ffn_pre_norm_2, nullptr,
-                    LLM_NORM_RMS, il);
+            // Expert FFN — reuse cached norm, apply ffn_pre_norm_2 weight
+            ggml_tensor * cur_moe = ggml_mul(ctx0, attn_out_normed, model.layers[il].ffn_pre_norm_2);
             cb(cur_moe, "ffn_norm_2", il);
 
-            // custom MoE logits calculation (router operates on attn_out, not cur)
-            ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
-            tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
-            tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
+            // MoE router logits — reuse cached norm, fuse scale+mul into single mul
+            // Original: rms_norm(attn_out) * (1/sqrt(n_embd)) * ffn_gate_inp_s
+            // Optimized: attn_out_normed * (ffn_gate_inp_s / sqrt(n_embd))
+            ggml_tensor * gate_s_scaled = ggml_scale(ctx0, model.layers[il].ffn_gate_inp_s,
+                    1.0f / sqrtf((float) n_embd));
+            ggml_tensor * tmp = ggml_mul(ctx0, attn_out_normed, gate_s_scaled);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
 

@@ -59,3 +59,23 @@
 - When support for a new model is added, update this file only with durable lessons that apply to future model ports too.
 
 For new model families, prefer verified surgical backports over full upstream merges.
+
+### Gemma 4 MoE performance (slow tk/s fix)
+
+#### Root cause
+Gemma 4 runs significantly slower than Qwen 3 MoE despite similar architecture because:
+1. **Triple RMS norm on `attn_out`**: on MoE layers, `attn_out` is RMS-normalized separately for the shared expert norm, expert input norm, and router logits. The fix is to compute `ggml_rms_norm(attn_out)` once and reuse the result, applying different weight tensors via `ggml_mul`.
+2. **Per-layer embedding CPU bottleneck**: `project_per_layer_inputs()` runs a large `ggml_mul_mat(per_layer_model_proj, inp_batch)` on CPU for every forward pass, plus ~7 additional ops per layer (gate projection, GELU, multiply, projection, norm, residual).
+3. **Dual FFN on MoE layers**: Gemma 4 runs both a full dense shared expert FFN and a sparse MoE FFN per MoE layer, then adds them. Qwen 3 MoE only has the sparse path.
+4. **V normalization**: Gemma 4 applies `ggml_rms_norm` to V before attention on KV layers (architecturally required, cannot be removed).
+
+#### Fix applied
+- Cached `ggml_rms_norm(attn_out)` once in the MoE block; reused for shared expert norm, expert input norm, and router logits → **eliminated 2 redundant kernel launches per MoE layer**.
+- Fused the router's `ggml_scale` + `ggml_mul` into a single pre-scaled `ggml_mul` → **eliminated 1 kernel launch per MoE layer**.
+- Created `run_server_gemma4.bat` with optimized launch parameters (context 8192, turbo3 K+V, ubatch 512, 12 threads).
+
+#### Durable lessons for future MoE models
+- When a model computes the same norm on the same tensor for multiple consumers (shared expert, routed experts, router logits), always cache the raw norm result and apply per-consumer weights separately.
+- Models with per-layer embedding systems (Gemma 3n, Gemma 4) inherit a CPU-bound matrix multiply that limits peak throughput regardless of GPU speed.
+- Always check whether a new architecture applies V normalization, as it adds a kernel launch per KV layer with no workaround.
+- For MoE models with shared + routed experts, reduce context length in launch params — the dual FFN doubles memory bandwidth requirements vs pure MoE.
